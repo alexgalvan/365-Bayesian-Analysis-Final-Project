@@ -1,0 +1,135 @@
+---
+title: "Final Project"
+output: html_document
+date: "2025-12-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(rstanarm)
+library(bayesplot)
+library(tidybayes)
+library(bayesrules)
+
+set.seed(36501)
+```
+
+
+```{r}
+# Load Dataset
+wine <- read.csv("WineQT.csv", header = TRUE)
+```
+
+```{r Bayesian Regression}
+#Full model
+summary(wine) #Prior for intercept, quality centered at roughly 5.5 with 1.5 SE
+
+prior_full_wine_model <- stan_glm(quality~., data = wine, family = gaussian, prior_intercept = normal(5.5, 1.5), prior = normal(0,  2.5, autoscale = TRUE), prior_aux = exponential(1, autoscale = TRUE), chains = 4, iter = 2*5000, seed = 36501, prior_PD = TRUE) #Use weakly informative priors for the Coefficients and Sigma
+
+#model relationship defined as
+#
+#     data:     Y_i | B0, B1,... B12, sigma ~ N(mu_i, sigma^2) with mu_i = B0 + B1*Xi_1 + ... + B12*Xi_12
+#     priors:   B0_c ~ N(5.5, 1.5^2)
+#               B1,...B12 ~ N(0, 2.5^2) #unassuming location and variance, weak
+#               sigma ~ Exp(1)
+
+#Plot to show predicted draws from the prior model for quality
+wine |>
+  add_predicted_draws(prior_full_wine_model, n = 100) |>
+  ggplot(aes(x = .prediction, group = .draw)) +
+    geom_density() + 
+    xlab("quality")
+
+#Plot to show fitted draws from the prior model between quality and alcohol
+wine |>
+  add_fitted_draws(prior_full_wine_model, n = 100) |>
+  ggplot(aes(x = alcohol, y = quality)) +
+    geom_line(aes(y = .value, group = .draw))
+
+#Both plots exhibit weak prior assumptions for coefficients and sigma
+
+#update model to posterior
+full_wine_model <- update(prior_full_wine_model, prior_PD = FALSE)
+
+# Confirm prior specification, possibly unnecessasry
+prior_summary(full_wine_model)
+
+summary(full_wine_model, probs = c(0.025, 0.975))
+
+# Check MCMC diagnostics
+mcmc_trace(full_wine_model)
+mcmc_dens_overlay(full_wine_model)
+mcmc_acf(full_wine_model) 
+
+#Diagnostics exhibit quick, well-mixing, trace plots with normal densities and low autocorrelation for the features. Rhats show variance stability between and within chains, and effective ratios between 0.4 and 1.1 for our coefficients, sigma, and intercept, also point to low autocorrelation. These diagnostics point to trustworthy results from the MCMC.
+
+#Estimates from the posterior summary also show that, for 95% of the probability densities, only volatile.acidity, chlorides, sulphates, and alcohol intervals outside of 0. We'll examine these in a reduced regression model using MCMC.
+
+reduced_wine_model <- stan_glm(quality~volatile.acidity+chlorides+sulphates+alcohol, data = wine, family = gaussian, prior_intercept = normal(5.5, 1.5), prior = normal(0,  2.5, autoscale = TRUE), prior_aux = exponential(1, autoscale = TRUE), chains = 4, iter = 2*5000, seed = 36501) #Same weakly informative priors for the Coefficients and Sigma
+
+summary(reduced_wine_model, probs = c(0.025, 0.975))
+
+# Check MCMC diagnostics
+mcmc_trace(reduced_wine_model)
+mcmc_dens_overlay(reduced_wine_model)
+mcmc_acf(reduced_wine_model)
+
+#Posterior Parameter sampling and comparison to data
+pp_check(full_wine_model)
+
+pp_check(reduced_wine_model) #Reduced model closer to data observations; multimodal traits of data is due to discrete values for quality.
+
+#Predictions
+full_predictions <- posterior_predict(full_wine_model, newdata = wine)
+
+reduced_predictions <- posterior_predict(reduced_wine_model, newdata = wine)
+
+ppc_intervals(y = wine$quality, yrep = full_predictions, x = wine$volatile.acidity, prob = 0.5, prob_outer = 0.95) + labs(x = 'Volatile.acidity' , y = 'Quality', title = 'Full Model')
+
+ppc_intervals(y = wine$quality, yrep = reduced_predictions, x = wine$volatile.acidity, prob = 0.5, prob_outer = 0.95) + labs(x = 'Volatile.acidity' , y = 'Quality', title = 'Reduced Model')
+
+#Reduced model has just as good coverage as full for posterior predictive intervals
+
+#Cross validation
+full_wine_cv <- prediction_summary_cv(data = wine, model = full_wine_model, k = 10)
+full_wine_cv$cv
+
+reduced_wine_cv <- prediction_summary_cv(data = wine, model = reduced_wine_model, k = 10)
+reduced_wine_cv$cv
+
+#The MAE between predicted quality and actual is typically small at about 0.4 for both models, 0.62 for scaled errors in both, and 0.53 for 50% PPIs, and 0.94 for 95% PPIs for both models as well. Prediction coverage is good with small error.
+
+#Expected Log-Predictive Densities for model comparison
+loo_1 <- loo(full_wine_model)
+loo_2 <- loo(reduced_wine_model)
+
+c(loo_1$estimates[1], loo_2$estimates[1])
+
+loo_compare(loo_1, loo_2)
+
+#Full model may have 6 units of better predictive power, with the true difference being roughly within 11.8 units or 2 SE of the estimated difference. With this small, and possibly 0, difference in predictive power, the smaller model is better.
+
+#Predictions at a particular set of predictor values
+wine_new <- as.data.frame(reduced_wine_model) |>
+  mutate(mu = `(Intercept)` + volatile.acidity*0.7 + chlorides*0.076 + sulphates*0.56 + alcohol*9.4, 
+         y_new = rnorm(20000, mu, sigma))
+
+wine_actual_obs <- wine |>
+  filter(volatile.acidity == 0.7, chlorides == 0.076, sulphates == 0.56, alcohol == 9.4) #Actual quality is 5
+
+wine_new |>
+  ggplot(aes(x = y_new)) +
+  geom_density() +
+  geom_vline(xintercept = mean(wine_new$y_new))
+
+wine_new |>
+  summarise(mean = mean(y_new), sd = sd(y_new), error = 5 - mean(y_new), scaled_error = (5 - mean(y_new)) / sd(y_new))
+
+#c
+ppc_intervals(wine$quality, yrep = matrix(wine_new$y_new, ncol = 1143), x = wine$volatile.acidity)
+
+#Model Predictions for some fixed predictor values accurately model the response. Average predicted error from the actual is small, as well as the scaled error. 
+```
+
